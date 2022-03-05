@@ -58,6 +58,7 @@ public class GameActivity extends Activity {
 
         // Initialize data that depends on Android resources.
         SoundResources.initialize(this);
+        GameRecorder.getInstance().prepareEncoder(this);
         TextResources.Configuration textConfig = TextResources.configure(this);
 
         mGameState = new GameState();
