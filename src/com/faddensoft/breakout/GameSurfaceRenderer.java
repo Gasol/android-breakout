@@ -16,10 +16,15 @@
 
 package com.faddensoft.breakout;
 
+import android.opengl.EGL14;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLSurface;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
 import android.opengl.Matrix;
 import android.os.ConditionVariable;
+import android.os.Trace;
 import android.util.Log;
 
 import javax.microedition.khronos.egl.EGLConfig;
@@ -39,11 +44,21 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
     // changes (e.g. when the device is rotated).
     static final float mProjectionMatrix[] = new float[16];
 
+    // used by saveRenderState() / restoreRenderState()
+    private final float mSavedMatrix[] = new float[16];
+    private EGLDisplay mSavedEglDisplay;
+    private EGLSurface mSavedEglDrawSurface;
+    private EGLSurface mSavedEglReadSurface;
+    private EGLContext mSavedEglContext;
+
     // Size and position of the GL viewport, in screen coordinates.  If the viewport covers the
     // entire screen, the offsets will be zero and the width/height values will match the
     // size of the display.  (This is one of the few places where we deal in actual pixels.)
     private int mViewportWidth, mViewportHeight;
     private int mViewportXoff, mViewportYoff;
+
+    // Frame counter, used for reducing recorder frame rate.
+    private int mFrameCount;
 
     private GameSurfaceView mSurfaceView;
     private GameState mGameState;
@@ -73,10 +88,6 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
     public void onSurfaceCreated(GL10 unused, EGLConfig config) {
         if (EXTRA_CHECK) Util.checkGlError("onSurfaceCreated start");
 
-        // Generate programs and data.
-        BasicAlignedRect.createProgram();
-        TexturedAlignedRect.createProgram();
-
         // Allocate objects associated with the various graphical elements.
         GameState gameState = mGameState;
         gameState.setTextResources(new TextResources(mTextConfig));
@@ -91,6 +102,32 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
         // Restore game state from static storage.
         gameState.restore();
 
+        // Generate programs and data.
+        BasicAlignedRect.createProgram();
+        TexturedAlignedRect.createProgram();
+
+        glSetup();
+
+        // now repeat it for the game recorder
+        GameRecorder recorder = GameRecorder.getInstance();
+        if (recorder.isRecording()) {
+            Log.d(TAG, "configuring GL for recorder");
+            saveRenderState();
+            recorder.firstTimeSetup();
+            recorder.makeCurrent();
+            glSetup();
+            restoreRenderState();
+
+            mFrameCount = 0;
+        }
+
+        if (EXTRA_CHECK) Util.checkGlError("onSurfaceCreated end");
+    }
+
+    /**
+     * Performs one-time GL setup (creating programs, disabling optional features).
+     */
+    private void glSetup() {
         // Set the background color.
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
@@ -104,8 +141,6 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
         } else {
             GLES20.glDisable(GLES20.GL_CULL_FACE);
         }
-
-        if (EXTRA_CHECK) Util.checkGlError("onSurfaceCreated end");
     }
 
     /**
@@ -158,12 +193,10 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
         Log.d(TAG, "onSurfaceChanged w=" + width + " h=" + height);
         Log.d(TAG, " --> x=" + x + " y=" + y + " gw=" + viewWidth + " gh=" + viewHeight);
 
-        GLES20.glViewport(x, y, viewWidth, viewHeight);
-
-        mViewportWidth = viewWidth;
-        mViewportHeight = viewHeight;
         mViewportXoff = x;
         mViewportYoff = y;
+        mViewportWidth = viewWidth;
+        mViewportHeight = viewHeight;
 
         // Create an orthographic projection that maps the desired arena size to the viewport
         // dimensions.
@@ -181,27 +214,97 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
     }
 
     /**
+     * Saves the current projection matrix and EGL state.
+     */
+    private void saveRenderState() {
+        System.arraycopy(mProjectionMatrix, 0, mSavedMatrix, 0, mProjectionMatrix.length);
+        mSavedEglDisplay = EGL14.eglGetCurrentDisplay();
+        mSavedEglDrawSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW);
+        mSavedEglReadSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ);
+        mSavedEglContext = EGL14.eglGetCurrentContext();
+    }
+
+    /**
+     * Saves the current projection matrix and EGL state.
+     */
+    private void restoreRenderState() {
+        // switch back to previous state
+        if (!EGL14.eglMakeCurrent(mSavedEglDisplay, mSavedEglDrawSurface, mSavedEglReadSurface,
+                mSavedEglContext)) {
+            throw new RuntimeException("eglMakeCurrent failed");
+        }
+        System.arraycopy(mSavedMatrix, 0, mProjectionMatrix, 0, mProjectionMatrix.length);
+    }
+
+    /**
      * Advances game state, then draws the new frame.
      */
     @Override
     public void onDrawFrame(GL10 unused) {
         GameState gameState = mGameState;
 
+        Trace.beginSection("calculate next frame");
         gameState.calculateNextFrame();
+        Trace.endSection();
 
         // Simulate slow game state update, to see impact on animation.
-//        try { Thread.sleep(33); }
-//        catch (InterruptedException ie) {}
+//      try { Thread.sleep(33); }
+//      catch (InterruptedException ie) {}
+
+        GLES20.glViewport(mViewportXoff, mViewportYoff, mViewportWidth, mViewportHeight);
+        drawFrame();
+
+        GameRecorder recorder = GameRecorder.getInstance();
+        if (recorder.isRecording() && recordThisFrame()) {
+            saveRenderState();
+
+            // switch to recorder state
+            recorder.makeCurrent();
+            recorder.getProjectionMatrix(mProjectionMatrix);
+            recorder.setViewport();
+
+            // render everything again
+            drawFrame();
+            recorder.swapBuffers();
+
+            restoreRenderState();
+        }
+
+        // Stop animating at 60fps (or whatever the refresh rate is) if the game is over.  Once
+        // we do this, we won't get here again unless something explicitly asks the system to
+        // render a new frame.  (As a handy side-effect, this prevents the paddle from actively
+        // moving after the game is over.)
+        //
+        // It's a bit clunky to be polling for this, but it needs to be controlled by GameState,
+        // and that class doesn't otherwise need to call back into us or have access to the
+        // GLSurfaceView.
+        if (!gameState.isAnimating()) {
+            Log.d(TAG, "Game over, stopping animation");
+            // While not explicitly documented as such, it appears that setRenderMode() may be
+            // called from any thread.  The getRenderMode() function is documented as being
+            // available from any thread, and looking at the sources reveals setRenderMode()
+            // uses the same synchronization.  If it weren't allowed, we'd need to post an
+            // event to the UI thread to do this.
+            mSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+        }
+    }
+
+    private void drawFrame() {
+        GameState gameState = mGameState;
 
         if (EXTRA_CHECK) Util.checkGlError("onDrawFrame start");
 
+        Trace.beginSection("render frame");
         // Clear entire screen to background color.
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
 
-        // Draw the various elements.  These are all BasicAlignedRect.
+        // Draw the various elements.  The prepareToDraw() call performs some expensive
+        // operations that are required for BasicAlignedRect drawing.
         BasicAlignedRect.prepareToDraw();
         gameState.drawBorders();
+        Trace.beginSection("draw bricks");
         gameState.drawBricks();
+        Trace.endSection();
         gameState.drawPaddle();
         BasicAlignedRect.finishedDrawing();
 
@@ -240,31 +343,39 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
         gameState.drawScore();
         gameState.drawBall();
         gameState.drawMessages();
-        TexturedAlignedRect.finishedDrawing();
-
         gameState.drawDebugStuff();
+        TexturedAlignedRect.finishedDrawing();
 
         // Turn alpha blending off.
         GLES20.glDisable(GLES20.GL_BLEND);
+        Trace.endSection();
 
         if (EXTRA_CHECK) Util.checkGlError("onDrawFrame end");
 
-        // Stop animating at 60fps (or whatever the refresh rate is) if the game is over.  Once
-        // we do this, we won't get here again unless something explicitly asks the system to
-        // render a new frame.  (As a handy side-effect, this prevents the paddle from actively
-        // moving after the game is over.)
-        //
-        // It's a bit clunky to be polling for this, but it needs to be controlled by GameState,
-        // and that class doesn't otherwise need to call back into us or have access to the
-        // GLSurfaceView.
-        if (!gameState.isAnimating()) {
-            Log.d(TAG, "Game over, stopping animation");
-            // While not explicitly documented as such, it appears that setRenderMode() may be
-            // called from any thread.  The getRenderMode() function is documented as being
-            // available from any thread, and looking at the sources reveals setRenderMode()
-            // uses the same synchronization.  If it weren't allowed, we'd need to post an
-            // event to the UI thread to do this.
-            mSurfaceView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+    }
+
+    /**
+     * Decides whether we want to record the current frame, based on the target frame rate
+     * and an assumed 60fps refresh rate.
+     * <p>
+     * We could be smarter here, and not drop a frame if the system dropped one inadvertently
+     * (i.e. we missed a vsync by being too slow).
+     */
+    private boolean recordThisFrame() {
+        final int TARGET_FPS = 30;
+
+        mFrameCount++;
+        switch (TARGET_FPS) {
+            case 60:
+                return true;
+            case 30:
+                return (mFrameCount & 0x01) == 0;
+            case 24:
+                // want 2 out of every 5 frames
+                int mod = mFrameCount % 5;
+                return mod == 0 || mod == 2;
+            default:
+                return true;
         }
     }
 
@@ -282,6 +393,8 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
          */
 
         mGameState.save();
+
+        GameRecorder.getInstance().gamePaused();
 
         syncObj.open();
     }
@@ -304,8 +417,8 @@ public class GameSurfaceRenderer implements GLSurfaceView.Renderer {
          * touches here.
          */
 
-        float arenaX = (x - mViewportXoff) * (GameState.ARENA_WIDTH / mViewportWidth);
-        float arenaY = (y - mViewportYoff) * (GameState.ARENA_HEIGHT / mViewportHeight);
+        float arenaX = (x - mViewportXoff) * (GameState.ARENA_WIDTH / (float) mViewportWidth);
+        float arenaY = (y - mViewportYoff) * (GameState.ARENA_HEIGHT / (float) mViewportHeight);
         //Log.v(TAG, "touch at x=" + (int) x + " y=" + (int) y + " --> arenaX=" + (int) arenaX);
 
         mGameState.movePaddle(arenaX);

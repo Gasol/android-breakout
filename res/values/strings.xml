@@ -16,7 +16,7 @@ limitations under the License.
 -->
 
 <resources>
-    <string name="app_name">Breakout</string>
+    <string name="app_name">RecBreakout</string>
     <string name="button_newGame">New Game</string>
     <string name="button_resumeGame">Resume Game</string>
     <string name="button_about">About</string>
